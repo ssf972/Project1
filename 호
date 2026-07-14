@@ -1,0 +1,353 @@
+import csv
+import math
+
+
+INPUT_FILE = "process_data.csv"
+ITEM_RESULT_FILE = "item_analysis.csv"
+STEP_RESULT_FILE = "step_analysis.csv"
+
+
+def to_number(value):
+    """문자열을 숫자로 변환합니다."""
+    try:
+        text = str(value).strip().replace(",", "")
+
+        if text in ("", "-", "NA", "N/A", "None"):
+            return None
+
+        return float(text)
+
+    except (ValueError, TypeError):
+        return None
+
+
+def clean_row(row):
+    """열 이름의 공백과 대소문자 차이를 제거합니다."""
+    cleaned = {}
+
+    for key, value in row.items():
+        if key is not None:
+            cleaned[key.strip().lower()] = value
+
+    return cleaned
+
+
+def classify_ppk(ppk):
+    if ppk is None:
+        return "판단불가"
+    elif ppk < 1.0:
+        return "Critical"
+    elif ppk < 1.33:
+        return "Warning"
+    elif ppk < 1.67:
+        return "Management"
+    else:
+        return "Good"
+
+
+def analyze_item(original_row):
+    row = clean_row(original_row)
+
+    step_id = row.get("step id", "")
+    step_name = row.get("step name", "")
+    item = row.get("item", "")
+    item_type = row.get("item type", "")
+    grade = row.get("등급", "")
+
+    lsl = to_number(row.get("lsl"))
+    target = to_number(row.get("target"))
+    usl = to_number(row.get("usl"))
+    ave = to_number(row.get("ave"))
+    stdev = to_number(row.get("stdev"))
+
+    ppk = to_number(row.get("ppk"))
+    pp = to_number(row.get("pp"))
+    cpm = to_number(row.get("cpm"))
+
+    t_center = to_number(row.get("t중심치"))
+    n_total = to_number(row.get("ntotal"))
+    n_sub = to_number(row.get("nsub"))
+    minimum = to_number(row.get("min"))
+    maximum = to_number(row.get("max"))
+
+    # 필수 데이터가 없는 행은 분석하지 않음
+    if None in (lsl, target, usl, ave, stdev):
+        return None
+
+    if usl <= lsl or stdev <= 0:
+        return None
+
+    spec_width = usl - lsl
+    target_offset = ave - target
+
+    # 데이터에 Pp가 없을 경우 계산
+    if pp is None:
+        pp = spec_width / (6 * stdev)
+
+    # 데이터에 Ppk가 없을 경우 계산
+    if ppk is None:
+        cpu = (usl - ave) / (3 * stdev)
+        cpl = (ave - lsl) / (3 * stdev)
+        ppk = min(cpu, cpl)
+
+    # 데이터에 Cpm이 없을 경우 계산
+    if cpm is None:
+        denominator = 6 * math.sqrt(
+            stdev ** 2 + target_offset ** 2
+        )
+
+        if denominator > 0:
+            cpm = spec_width / denominator
+
+    center_rate = (
+        abs(target_offset) / (spec_width / 2) * 100
+    )
+
+    lower_margin = ave - lsl
+    upper_margin = usl - ave
+    minimum_margin = min(lower_margin, upper_margin)
+
+    margin_rate = minimum_margin / spec_width * 100
+    pp_ppk_gap = pp - ppk
+
+    # 위험점수 계산
+    risk_score = 0
+
+    if ppk < 1.0:
+        risk_score += 50
+    elif ppk < 1.33:
+        risk_score += 35
+    elif ppk < 1.67:
+        risk_score += 15
+
+    risk_score += min(center_rate * 0.25, 25)
+
+    if margin_rate <= 0:
+        risk_score += 15
+    elif margin_rate < 10:
+        risk_score += 12
+    elif margin_rate < 20:
+        risk_score += 8
+    elif margin_rate < 30:
+        risk_score += 4
+
+    risk_score += min(max(pp_ppk_gap, 0) * 20, 10)
+
+    # 문제 유형 진단
+    problems = []
+
+    if ppk < 1.0:
+        problems.append("공정능력 매우 부족")
+    elif ppk < 1.33:
+        problems.append("공정능력 개선 필요")
+
+    if pp < 1.33:
+        problems.append("산포 큼")
+
+    if pp_ppk_gap >= 0.3:
+        problems.append("평균 중심 이탈")
+
+    if center_rate >= 40:
+        problems.append("Target 이탈 큼")
+    elif center_rate >= 20:
+        problems.append("Target 조정 필요")
+
+    if minimum_margin <= 0:
+        problems.append("평균 규격 이탈")
+
+    if not problems:
+        problems.append("특이사항 없음")
+
+    return {
+        "Step ID": step_id,
+        "Step Name": step_name,
+        "Item": item,
+        "Item Type": item_type,
+        "등급": grade,
+        "LSL": lsl,
+        "Target": target,
+        "USL": usl,
+        "Ave": ave,
+        "Stdev": stdev,
+        "Ppk": round(ppk, 3),
+        "Pp": round(pp, 3),
+        "Cpm": round(cpm, 3),
+        "T중심치": t_center,
+        "Ntotal": n_total,
+        "Nsub": n_sub,
+        "Min": minimum,
+        "Max": maximum,
+        "중심이탈률(%)": round(center_rate, 2),
+        "최소 Margin": round(minimum_margin, 3),
+        "Margin 비율(%)": round(margin_rate, 2),
+        "Pp-Ppk Gap": round(pp_ppk_gap, 3),
+        "상태": classify_ppk(ppk),
+        "위험점수": round(risk_score, 2),
+        "문제 유형": ", ".join(problems),
+    }
+
+
+def read_csv(file_name):
+    """UTF-8 또는 CP949 CSV를 읽습니다."""
+    encodings = ["utf-8-sig", "cp949", "utf-8"]
+
+    for encoding in encodings:
+        try:
+            with open(
+                file_name,
+                "r",
+                encoding=encoding,
+                newline=""
+            ) as file:
+
+                reader = csv.DictReader(file)
+
+                print("확인된 열 이름:")
+                print(reader.fieldnames)
+
+                return list(reader)
+
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError("CSV 파일 인코딩을 읽을 수 없습니다.")
+
+
+def make_step_summary(item_results):
+    """Step Name별 공정능력과 위험도를 집계합니다."""
+    step_data = {}
+
+    for item in item_results:
+        step_name = item["Step Name"]
+
+        if step_name not in step_data:
+            step_data[step_name] = {
+                "Step Name": step_name,
+                "항목 수": 0,
+                "Ppk 합계": 0,
+                "위험점수 합계": 0,
+                "최소 Ppk": None,
+                "Critical 수": 0,
+                "Warning 수": 0,
+            }
+
+        step = step_data[step_name]
+
+        step["항목 수"] += 1
+        step["Ppk 합계"] += item["Ppk"]
+        step["위험점수 합계"] += item["위험점수"]
+
+        if (
+            step["최소 Ppk"] is None
+            or item["Ppk"] < step["최소 Ppk"]
+        ):
+            step["최소 Ppk"] = item["Ppk"]
+
+        if item["상태"] == "Critical":
+            step["Critical 수"] += 1
+
+        if item["상태"] == "Warning":
+            step["Warning 수"] += 1
+
+    summaries = []
+
+    for step in step_data.values():
+        count = step["항목 수"]
+
+        average_ppk = step["Ppk 합계"] / count
+        average_risk = step["위험점수 합계"] / count
+
+        summaries.append({
+            "Step Name": step["Step Name"],
+            "항목 수": count,
+            "평균 Ppk": round(average_ppk, 3),
+            "최소 Ppk": round(step["최소 Ppk"], 3),
+            "평균 위험점수": round(average_risk, 2),
+            "Critical 수": step["Critical 수"],
+            "Warning 수": step["Warning 수"],
+        })
+
+    summaries.sort(
+        key=lambda x: (
+            x["평균 위험점수"],
+            -x["최소 Ppk"]
+        ),
+        reverse=True
+    )
+
+    for rank, summary in enumerate(summaries, start=1):
+        summary["관리순위"] = rank
+
+    return summaries
+
+
+def save_csv(file_name, rows):
+    if not rows:
+        return
+
+    columns = list(rows[0].keys())
+
+    with open(
+        file_name,
+        "w",
+        encoding="utf-8-sig",
+        newline=""
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=columns
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main():
+    rows = read_csv(INPUT_FILE)
+
+    item_results = []
+
+    for line_number, row in enumerate(rows, start=2):
+        result = analyze_item(row)
+
+        if result is None:
+            print(
+                f"{line_number}행 제외: "
+                "필수 데이터가 없거나 숫자 형식이 잘못되었습니다."
+            )
+            continue
+
+        item_results.append(result)
+
+    item_results.sort(
+        key=lambda x: x["위험점수"],
+        reverse=True
+    )
+
+    for rank, result in enumerate(item_results, start=1):
+        result["항목순위"] = rank
+
+    step_results = make_step_summary(item_results)
+
+    save_csv(ITEM_RESULT_FILE, item_results)
+    save_csv(STEP_RESULT_FILE, step_results)
+
+    print("\n분석 완료")
+    print("항목별 결과:", ITEM_RESULT_FILE)
+    print("Step별 결과:", STEP_RESULT_FILE)
+
+    print("\n위험 Step TOP 10")
+
+    for step in step_results[:10]:
+        print(
+            step["관리순위"],
+            step["Step Name"],
+            "평균 Ppk =", step["평균 Ppk"],
+            "최소 Ppk =", step["최소 Ppk"],
+            "위험점수 =", step["평균 위험점수"]
+        )
+
+
+if __name__ == "__main__":
+    main()
